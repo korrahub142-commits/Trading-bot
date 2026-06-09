@@ -146,6 +146,10 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
 
 class HealthHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
