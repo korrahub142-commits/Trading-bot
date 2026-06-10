@@ -73,6 +73,7 @@ brain.train(historical_df)
 print("Starting main trading loop. Will check every 60 seconds.\n")
 while True:
     try:
+        print(f"DEBUG: Loop running at {datetime.now().strftime('%H:%M:%S')}")
         # Fetch latest daily bar (to update the dataframe)
         new_data = spy.history(period="5d", interval="1d")
         if not new_data.empty:
