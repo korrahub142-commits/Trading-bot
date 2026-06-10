@@ -3,7 +3,6 @@
 import numpy as np
 import pandas as pd
 from hmmlearn import hmm
-import ta   # <-- added for RSI indicator
 
 class MarketBrain:
     """
@@ -64,6 +63,13 @@ class MarketBrain:
         return self.state_labels[state]
 
     def get_rsi(self, df, period=14):
-        """Calculate RSI and return the latest value."""
-        rsi = ta.momentum.RSIIndicator(close=df['close'], window=period)
-        return rsi.rsi().iloc[-1]
+        """
+        Calculate RSI using pure pandas (no extra library).
+        Returns the latest RSI value.
+        """
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.iloc[-1]
