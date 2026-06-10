@@ -25,7 +25,6 @@ def run_health_server():
 Thread(target=run_health_server, daemon=True).start()
 print(f"Health check server running on port {os.environ.get('PORT', 8000)}")
 # -----------------------------------------
-from dotenv import load_dotenv
 import os
 import yfinance as yf
 
@@ -34,10 +33,12 @@ from allocation import PositionAllocator
 from safety import SafetyNet
 from broker import BrokerConnection
 
-# Load environment variables
-load_dotenv()
+# Get API keys from environment variables (set in Railway)
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
+
+if not API_KEY or not SECRET_KEY:
+    raise ValueError("Missing API keys. Set APCA_API_KEY_ID and APCA_API_SECRET_KEY as environment variables.")
 
 if not API_KEY or not SECRET_KEY:
     raise ValueError("Missing API keys in .env file")
