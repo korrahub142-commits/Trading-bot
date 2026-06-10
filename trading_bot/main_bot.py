@@ -68,6 +68,7 @@ print(f"Training data: {len(historical_df)} days")
 
 # Train the brain
 brain.train(historical_df)
+print("Training complete. Entering main loop...")
 
 # Main trading loop
 print("Starting main trading loop. Will check every 60 seconds.\n")
