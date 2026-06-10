@@ -2,8 +2,8 @@
 
 import numpy as np
 import pandas as pd
-import ta
 from hmmlearn import hmm
+import ta
 
 class MarketBrain:
     """
