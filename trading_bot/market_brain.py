@@ -1,9 +1,9 @@
-﻿# market_brain.py
+# market_brain.py
 
 import numpy as np
 import pandas as pd
 from hmmlearn import hmm
-import ta
+import ta   # <-- added for RSI indicator
 
 class MarketBrain:
     """
@@ -16,10 +16,6 @@ class MarketBrain:
         self.model = hmm.GaussianHMM(n_components=n_states, covariance_type="full", n_iter=1000)
         self.is_fitted = False
         self.state_labels = {}
-    def get_rsi(self, df, period=14):
-        """Calculate RSI and return the latest value"""
-        rsi = ta.momentum.RSIIndicator(close=df['close'], window=period)
-        return rsi.rsi().iloc[-1]
 
     def _prepare_features(self, df):
         """Convert price data into returns and volatility for the HMM."""
@@ -35,7 +31,8 @@ class MarketBrain:
         features = self._prepare_features(df)
         self.model.fit(features)
         self.is_fitted = True
-        
+
+        # Predict states for the training data to label them
         states = self.model.predict(features)
         self._label_states(features, states)
         print("Training complete!")
@@ -46,9 +43,9 @@ class MarketBrain:
         for state in range(self.n_states):
             state_returns = features[states == state, 0]
             state_means[state] = np.mean(state_returns) if len(state_returns) > 0 else 0
-        
+
         sorted_states = sorted(state_means, key=state_means.get)
-        
+
         self.state_labels = {
             sorted_states[0]: "Crash",
             sorted_states[1]: "Bear",
@@ -61,7 +58,12 @@ class MarketBrain:
         """Predict the current market state using the trained model."""
         if not self.is_fitted:
             raise Exception("Brain hasn't been trained yet! Run 'train' first.")
-        
+
         features = self._prepare_features(df)
         state = self.model.predict(features[-1].reshape(1, -1))[0]
         return self.state_labels[state]
+
+    def get_rsi(self, df, period=14):
+        """Calculate RSI and return the latest value."""
+        rsi = ta.momentum.RSIIndicator(close=df['close'], window=period)
+        return rsi.rsi().iloc[-1]
