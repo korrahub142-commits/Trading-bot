@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+import ta
 from hmmlearn import hmm
 
 class MarketBrain:
@@ -15,6 +16,11 @@ class MarketBrain:
         self.model = hmm.GaussianHMM(n_components=n_states, covariance_type="full", n_iter=1000)
         self.is_fitted = False
         self.state_labels = {}
+        
+     def get_rsi(self, df, period=14):
+        """Calculate RSI and return the latest value"""
+        rsi = ta.momentum.RSIIndicator(close=df['close'], window=period)
+        return rsi.rsi().iloc[-1]
 
     def _prepare_features(self, df):
         """Convert price data into returns and volatility for the HMM."""
