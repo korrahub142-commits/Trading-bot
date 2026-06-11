@@ -73,3 +73,19 @@ class MarketBrain:
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
         return rsi.iloc[-1]
+
+    def get_atr(self, df, period=14):
+        """
+        Calculate ATR using pure pandas (no extra library).
+        Returns the latest ATR value.
+        """
+        # Use high/low if available, otherwise fallback to close
+        high = df['high'] if 'high' in df.columns else df['close']
+        low = df['low'] if 'low' in df.columns else df['close']
+        close = df['close']
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        return atr.iloc[-1]
