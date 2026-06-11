@@ -85,7 +85,7 @@ while True:
         current_market_state = brain.predict_current_market(historical_df)
         print(f"Market is currently: {current_market_state}")
 
-        # Calculate and print RSI
+        # Calculate RSI
         rsi_value = brain.get_rsi(historical_df)
         print(f"RSI(14): {rsi_value:.2f}")
 
@@ -110,8 +110,8 @@ while True:
         target_shares = int(allocator.calculate_position_size(current_market_state, volatility))
         print(f"Target shares to buy/sell: {target_shares}")
 
-        # Trading decision (simple version)
-        if current_market_state in ["Bull", "Euphoria"] and target_shares > 0:
+        # ---------- Trading decision with RSI filter ----------
+        if current_market_state in ["Bull", "Euphoria"] and target_shares > 0 and rsi_value < 70:
             # Check existing SPY position
             positions = broker.trading_client.get_all_positions()
             current_spy_shares = 0
@@ -120,21 +120,22 @@ while True:
                     current_spy_shares = float(pos.qty)
                     break
             if current_spy_shares == 0:
-                print(f"Placing BUY order for {target_shares} shares of SPY")
+                print(f"RSI {rsi_value:.2f} is below 70 – Placing BUY order for {target_shares} shares of SPY")
                 broker.submit_order("SPY", target_shares, "buy")
             else:
                 print(f"Already hold {current_spy_shares} shares. Skipping buy.")
-        elif current_market_state in ["Bear", "Crash"]:
+        elif current_market_state in ["Bear", "Crash"] and rsi_value > 30:
             # Close all SPY positions
             positions = broker.trading_client.get_all_positions()
             for pos in positions:
                 if pos.symbol == "SPY":
                     qty = float(pos.qty)
                     if qty > 0:
-                        print(f"Closing position: selling {qty} shares of SPY")
+                        print(f"RSI {rsi_value:.2f} is above 30 – Closing position: selling {qty} shares of SPY")
                         broker.submit_order("SPY", qty, "sell")
         else:
-            print("No action.")
+            print(f"No action. RSI = {rsi_value:.2f}")
+        # -------------------------------------------------------
 
         print("-" * 50)
         time.sleep(60)
