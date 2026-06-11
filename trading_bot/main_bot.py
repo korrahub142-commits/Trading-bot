@@ -18,7 +18,7 @@ def send_telegram_message(message):
         print("WARNING: Attempted to send empty Telegram message")
         return
     bot_token = "8954699344:AAG_d5zazERDqhmq-j4CqseYMrYSX8G3__s"
-    chat_id = "993606490"
+    chat_id = "1217871917"
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
     try:
