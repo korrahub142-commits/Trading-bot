@@ -60,8 +60,8 @@ print(f"Training data: {len(historical_df)} days")
 
 brain.train(historical_df)
 
-# Store trailing stop info per symbol (simple dictionary)
-trailing_stops = {}  # { 'SPY': { 'active': bool, 'stop_price': float, 'highest_close': float, 'entry_price': float } }
+# Store trade state per symbol
+trade_state = {}  # { 'SPY': { 'entry_price': float, 'initial_shares': int, 'tp1_hit': bool } }
 
 print("Starting main trading loop. Will check every 60 seconds.\n")
 while True:
@@ -98,64 +98,72 @@ while True:
             print("Circuit breaker triggered. Bot halted.")
             break
 
-        # Check current SPY position
+        # Get current SPY position
         positions = broker.trading_client.get_all_positions()
         current_spy_shares = 0
+        entry_price = None
         for pos in positions:
             if pos.symbol == "SPY":
                 current_spy_shares = float(pos.qty)
+                entry_price = float(pos.avg_entry_price)
                 break
 
-        # --- Trailing stop management (if position exists) ---
-        if current_spy_shares > 0:
-            # Get the current price (use close)
+        # --- Trailing stop & take profit management (if position exists) ---
+        if current_spy_shares > 0 and entry_price:
             current_price = historical_df['close'].iloc[-1]
-            # Get or create trailing stop record
-            if 'SPY' not in trailing_stops:
-                # First time we see a position – initialise trailing stop
-                # We need the entry price. For simplicity, get the average entry price from Alpaca.
-                entry_price = None
-                for pos in positions:
-                    if pos.symbol == "SPY":
-                        entry_price = float(pos.avg_entry_price)
-                        break
-                if entry_price:
-                    trailing_stops['SPY'] = {
-                        'active': False,
-                        'stop_price': entry_price - 2 * atr,  # initial stop
-                        'highest_close': current_price,
-                        'entry_price': entry_price,
-                        'breakeven_activated': False
-                    }
-                    print(f"Initial stop set at ${trailing_stops['SPY']['stop_price']:.2f}")
-            else:
-                ts = trailing_stops['SPY']
-                # Update highest close since entry
-                if current_price > ts['highest_close']:
-                    ts['highest_close'] = current_price
-                    print(f"New highest close: ${current_price:.2f}")
+            # Initialize trade state if not present
+            if 'SPY' not in trade_state:
+                trade_state['SPY'] = {
+                    'entry_price': entry_price,
+                    'initial_shares': current_spy_shares,
+                    'tp1_hit': False,
+                    'stop_price': entry_price - 2 * atr,
+                    'highest_close': current_price,
+                    'breakeven_activated': False
+                }
+                print(f"Initial stop set at ${trade_state['SPY']['stop_price']:.2f}")
+                print(f"Take profit level set at ${entry_price + 1.5 * atr:.2f} (1.5×ATR)")
 
-                # Breakeven: move stop to entry price once price >= entry + 1*ATR
-                if not ts.get('breakeven_activated', False) and current_price >= ts['entry_price'] + atr:
-                    ts['stop_price'] = ts['entry_price']
-                    ts['breakeven_activated'] = True
-                    print(f"Breakeven stop activated at ${ts['stop_price']:.2f}")
+            ts = trade_state['SPY']
+            # Update highest close
+            if current_price > ts['highest_close']:
+                ts['highest_close'] = current_price
+                print(f"New highest close: ${current_price:.2f}")
 
-                # Trailing: after breakeven, keep stop 2*ATR below highest close
-                if ts.get('breakeven_activated', False):
-                    new_stop = ts['highest_close'] - 2 * atr
-                    if new_stop > ts['stop_price']:
-                        ts['stop_price'] = new_stop
-                        print(f"Trailing stop raised to ${ts['stop_price']:.2f}")
+            # Breakeven: move stop to entry once price >= entry + 1*ATR
+            if not ts.get('breakeven_activated', False) and current_price >= ts['entry_price'] + atr:
+                ts['stop_price'] = ts['entry_price']
+                ts['breakeven_activated'] = True
+                print(f"Breakeven stop activated at ${ts['stop_price']:.2f}")
 
-                # Check if stop loss is hit
-                if current_price <= ts['stop_price']:
-                    print(f"Stop loss hit at ${current_price:.2f} – selling {current_spy_shares} shares")
-                    broker.submit_order("SPY", current_spy_shares, "sell")
-                    del trailing_stops['SPY']  # clear trailing data
-                    # Skip the rest of the loop after selling
-                    time.sleep(60)
-                    continue
+            # Trailing: after breakeven, raise stop to highest_close - 2*ATR
+            if ts.get('breakeven_activated', False):
+                new_stop = ts['highest_close'] - 2 * atr
+                if new_stop > ts['stop_price']:
+                    ts['stop_price'] = new_stop
+                    print(f"Trailing stop raised to ${ts['stop_price']:.2f}")
+
+            # Take profit level (1.5×ATR)
+            tp1_price = ts['entry_price'] + 1.5 * atr
+            if not ts['tp1_hit'] and current_price >= tp1_price:
+                # Sell half of the current position
+                shares_to_sell = int(current_spy_shares / 2)
+                if shares_to_sell > 0:
+                    print(f"Take profit hit at ${current_price:.2f} – selling {shares_to_sell} shares (half position)")
+                    broker.submit_order("SPY", shares_to_sell, "sell")
+                    ts['tp1_hit'] = True
+                    # Update current_spy_shares for this loop (will refresh on next iteration)
+                    current_spy_shares -= shares_to_sell
+                    print(f"Remaining shares: {current_spy_shares}. Trail will continue on remaining half.")
+
+            # Check if stop loss is hit
+            if current_price <= ts['stop_price']:
+                print(f"Stop loss hit at ${current_price:.2f} – selling {current_spy_shares} shares")
+                broker.submit_order("SPY", current_spy_shares, "sell")
+                del trade_state['SPY']
+                # Skip the rest of the loop after selling
+                time.sleep(60)
+                continue
 
         # --- Entry logic (only if no position) ---
         if current_spy_shares == 0:
@@ -174,12 +182,15 @@ while True:
             if current_market_state in ["Bull", "Euphoria"] and target_shares > 0 and rsi_value < 70:
                 print(f"RSI {rsi_value:.2f} is below 70 – Placing BUY order for {target_shares} shares of SPY")
                 broker.submit_order("SPY", target_shares, "buy")
-                # Trailing stop will be initialised on next cycle when position is detected
+                # Trade state will be initialised on next cycle when position is detected
             else:
                 print(f"No buy. RSI = {rsi_value:.2f}")
         else:
-            # Already have a position – just print status
-            print(f"Holding {current_spy_shares} shares. Trailing stop active: {trailing_stops.get('SPY', {}).get('stop_price', 'N/A')}")
+            # Already have a position – print status
+            ts = trade_state.get('SPY', {})
+            stop_price = ts.get('stop_price', 'N/A')
+            tp1_status = "Hit" if ts.get('tp1_hit', False) else "Not hit"
+            print(f"Holding {current_spy_shares} shares. Stop: ${stop_price} | TP1: {tp1_status}")
 
         print("-" * 50)
         time.sleep(60)
