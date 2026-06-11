@@ -5,11 +5,23 @@ import numpy as np
 from datetime import datetime, timedelta
 import os
 import yfinance as yf
+import requests
 
 from market_brain import MarketBrain
 from allocation import PositionAllocator
 from safety import SafetyNet
 from broker import BrokerConnection
+
+# --- Telegram alert function ---
+def send_telegram_message(message):
+    bot_token = "8954699344:AAG_d5zazERDqhmq-j4CqseYMrYSX8G3__s"
+    chat_id = "993606490"
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        print(f"Failed to send Telegram alert: {e}")
 
 # --- Keep-alive web server ---
 from threading import Thread
@@ -60,8 +72,11 @@ print(f"Training data: {len(historical_df)} days")
 
 brain.train(historical_df)
 
+# Send startup alert
+send_telegram_message("🤖 Trading bot started. Monitoring market...")
+
 # Store trade state per symbol
-trade_state = {}  # { 'SPY': { 'entry_price': float, 'initial_shares': int, 'tp1_hit': bool } }
+trade_state = {}
 
 print("Starting main trading loop. Will check every 60 seconds.\n")
 while True:
@@ -95,7 +110,7 @@ while True:
 
         # Safety net
         if safety_net.update_portfolio_value(portfolio_value):
-            print("Circuit breaker triggered. Bot halted.")
+            send_telegram_message("⚠️ Circuit breaker triggered. Trading halted.")
             break
 
         # Get current SPY position
@@ -123,6 +138,7 @@ while True:
                 }
                 print(f"Initial stop set at ${trade_state['SPY']['stop_price']:.2f}")
                 print(f"Take profit level set at ${entry_price + 1.5 * atr:.2f} (1.5×ATR)")
+                send_telegram_message(f"📈 New trade: bought {current_spy_shares} SPY @ ${entry_price:.2f}\nStop: ${trade_state['SPY']['stop_price']:.2f}\nTP1: ${entry_price + 1.5 * atr:.2f}")
 
             ts = trade_state['SPY']
             # Update highest close
@@ -130,44 +146,42 @@ while True:
                 ts['highest_close'] = current_price
                 print(f"New highest close: ${current_price:.2f}")
 
-            # Breakeven: move stop to entry once price >= entry + 1*ATR
+            # Breakeven
             if not ts.get('breakeven_activated', False) and current_price >= ts['entry_price'] + atr:
                 ts['stop_price'] = ts['entry_price']
                 ts['breakeven_activated'] = True
                 print(f"Breakeven stop activated at ${ts['stop_price']:.2f}")
+                send_telegram_message(f"🔒 Breakeven stop activated for SPY (entry: ${ts['entry_price']:.2f})")
 
-            # Trailing: after breakeven, raise stop to highest_close - 2*ATR
+            # Trailing
             if ts.get('breakeven_activated', False):
                 new_stop = ts['highest_close'] - 2 * atr
                 if new_stop > ts['stop_price']:
                     ts['stop_price'] = new_stop
                     print(f"Trailing stop raised to ${ts['stop_price']:.2f}")
 
-            # Take profit level (1.5×ATR)
+            # Take profit
             tp1_price = ts['entry_price'] + 1.5 * atr
             if not ts['tp1_hit'] and current_price >= tp1_price:
-                # Sell half of the current position
                 shares_to_sell = int(current_spy_shares / 2)
                 if shares_to_sell > 0:
                     print(f"Take profit hit at ${current_price:.2f} – selling {shares_to_sell} shares (half position)")
                     broker.submit_order("SPY", shares_to_sell, "sell")
                     ts['tp1_hit'] = True
-                    # Update current_spy_shares for this loop (will refresh on next iteration)
+                    send_telegram_message(f"🎯 Take profit 1 hit at ${current_price:.2f}\nSold {shares_to_sell} SPY. Remaining {current_spy_shares - shares_to_sell} shares.")
                     current_spy_shares -= shares_to_sell
-                    print(f"Remaining shares: {current_spy_shares}. Trail will continue on remaining half.")
 
-            # Check if stop loss is hit
+            # Stop loss
             if current_price <= ts['stop_price']:
                 print(f"Stop loss hit at ${current_price:.2f} – selling {current_spy_shares} shares")
                 broker.submit_order("SPY", current_spy_shares, "sell")
+                send_telegram_message(f"🛑 Stop loss hit at ${current_price:.2f}\nSold {current_spy_shares} SPY. Trade closed.")
                 del trade_state['SPY']
-                # Skip the rest of the loop after selling
                 time.sleep(60)
                 continue
 
         # --- Entry logic (only if no position) ---
         if current_spy_shares == 0:
-            # Position sizing
             close_prices = historical_df['close'].dropna()
             if len(close_prices) > 20:
                 returns = np.log(close_prices / close_prices.shift(1)).dropna()
@@ -178,15 +192,13 @@ while True:
             target_shares = int(allocator.calculate_position_size(current_market_state, volatility))
             print(f"Target shares to buy: {target_shares}")
 
-            # Buy condition: Bull/Euphoria, RSI<70, and no position
             if current_market_state in ["Bull", "Euphoria"] and target_shares > 0 and rsi_value < 70:
                 print(f"RSI {rsi_value:.2f} is below 70 – Placing BUY order for {target_shares} shares of SPY")
                 broker.submit_order("SPY", target_shares, "buy")
-                # Trade state will be initialised on next cycle when position is detected
+                send_telegram_message(f"🚀 Buying {target_shares} SPY\nMarket regime: {current_market_state}\nRSI: {rsi_value:.2f}\nATR: {atr:.2f}")
             else:
                 print(f"No buy. RSI = {rsi_value:.2f}")
         else:
-            # Already have a position – print status
             ts = trade_state.get('SPY', {})
             stop_price = ts.get('stop_price', 'N/A')
             tp1_status = "Hit" if ts.get('tp1_hit', False) else "Not hit"
@@ -199,5 +211,7 @@ while True:
         print("Shutting down bot.")
         break
     except Exception as e:
-        print(f"Error: {e}")
+        error_msg = f"Error: {e}"
+        print(error_msg)
+        send_telegram_message(f"⚠️ Bot error: {error_msg}")
         time.sleep(60)
