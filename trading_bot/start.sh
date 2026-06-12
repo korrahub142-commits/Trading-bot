@@ -1,2 +1,3 @@
 #!/bin/bash
-python3 main_bot.py
+pip install ta --quiet
+python main_bot.py
