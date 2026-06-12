@@ -1,4 +1,4 @@
-# main_bot.py – 8‑ETF multi‑symbol, only one active trade at a time
+# main_bot.py – 8‑ETF + HMM regime filter (only trade in Bull/Euphoria)
 import time
 import pandas as pd
 import numpy as np
@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import os
 import requests
 import yfinance as yf
+from hmmlearn import hmm
 
 from alpaca.trading.client import TradingClient
 from allocation import PositionAllocator
@@ -61,9 +62,62 @@ if not API_KEY or not SECRET_KEY:
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 broker = BrokerConnection(API_KEY, SECRET_KEY, is_paper=True)
 
-# ------------------------------
-# Pure pandas indicator functions
-# ------------------------------
+# ============================================================
+# HMM MARKET REGIME (on SPY daily)
+# ============================================================
+def train_hmm_regime():
+    """Train HMM on SPY daily data, return model and label mapping."""
+    spy = yf.Ticker("SPY")
+    end = datetime.now()
+    start = end - timedelta(days=365*2)
+    df = spy.history(start=start, end=end, interval="1d")
+    df['returns'] = np.log(df['Close'] / df['Close'].shift(1))
+    df['volatility'] = df['returns'].rolling(20).std() * np.sqrt(252)
+    features = df[['returns', 'volatility']].dropna().values
+    model = hmm.GaussianHMM(n_components=5, covariance_type="full", n_iter=1000, random_state=42)
+    model.fit(features)
+    states = model.predict(features)
+    # Determine which state corresponds to Bull/Euphoria (higher mean return)
+    state_means = []
+    for s in range(5):
+        state_means.append(features[states == s, 0].mean())
+    sorted_states = np.argsort(state_means)
+    # Assume sorted[4] is Euphoria, sorted[3] is Bull, sorted[2] Neutral, sorted[1] Bear, sorted[0] Crash
+    bull_state = sorted_states[3]
+    euphoria_state = sorted_states[4]
+    return model, df, bull_state, euphoria_state
+
+print("Training HMM regime on SPY daily data...")
+hmm_model, hmm_df, BULL_STATE, EUPHORIA_STATE = train_hmm_regime()
+print("HMM ready.")
+
+def get_current_regime():
+    """Fetch latest SPY daily bar, predict regime, return string and boolean for good trading."""
+    spy = yf.Ticker("SPY")
+    end = datetime.now()
+    start = end - timedelta(days=5)  # get last 5 days to be safe
+    new_data = spy.history(start=start, end=end, interval="1d")
+    if new_data.empty:
+        return "Unknown", False
+    # Combine with training data to compute features
+    combined = pd.concat([hmm_df, new_data]).drop_duplicates()
+    combined['returns'] = np.log(combined['Close'] / combined['Close'].shift(1))
+    combined['volatility'] = combined['returns'].rolling(20).std() * np.sqrt(252)
+    latest = combined.iloc[-1:]
+    if pd.isna(latest['returns'].iloc[0]) or pd.isna(latest['volatility'].iloc[0]):
+        return "Unknown", False
+    features = latest[['returns', 'volatility']].values
+    state = hmm_model.predict(features)[0]
+    if state == BULL_STATE:
+        return "Bull", True
+    elif state == EUPHORIA_STATE:
+        return "Euphoria", True
+    else:
+        return "Other", False
+
+# ============================================================
+# Indicator functions (pure pandas)
+# ============================================================
 def rsi(close, period=14):
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -112,9 +166,6 @@ def atr(high, low, close, period=14):
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
-# ------------------------------
-# Compute all 8 signals
-# ------------------------------
 def compute_signals(df):
     df = df.copy()
     df['rsi'] = rsi(df['close'], 14)
@@ -136,9 +187,6 @@ def compute_signals(df):
     df['sig_tdi'] = tdi_green > tdi_red
     return df
 
-# ------------------------------
-# Fetch 1‑hour data from Yahoo Finance
-# ------------------------------
 def get_1h_bars_yf(symbol, period="60d"):
     ticker = yf.Ticker(symbol)
     df = ticker.history(period=period, interval="1h")
@@ -172,46 +220,45 @@ initial_value = float(account.portfolio_value)
 print(f"Initial portfolio value: ${initial_value:,.2f}")
 safety_net = SafetyNet(initial_portfolio_value=initial_value)
 
-send_telegram_message(f"🤖 8‑ETF bot started (one active trade max). TP2 enabled. Symbols: {', '.join(SYMBOLS)}")
+send_telegram_message(f"🤖 HMM + 8‑indicator bot started (one active trade max). TP2 enabled. Symbols: {', '.join(SYMBOLS)}")
 
-# Trade state per symbol (only one will be active at a time)
+# Trade state per symbol
 trade_state = {sym: {} for sym in SYMBOLS}
 last_timestamp = {sym: dataframes[sym].index[-1] for sym in SYMBOLS}
 
-# Global flag to ensure only one trade at a time
 has_active_position = False
 active_symbol = None
 
 # ------------------------------
-# Main loop – check all symbols every 60 seconds
+# Main loop
 # ------------------------------
-print("Starting main loop (checks every 60 seconds). Only one trade at a time.\n")
+print("Starting main loop (checks every 60 seconds). HMM filter active: only trade in Bull/Euphoria.\n")
 while True:
     try:
-        # First, update global position status from Alpaca
+        # Update global position status
         positions = trading_client.get_all_positions()
         current_positions = [p.symbol for p in positions if float(p.qty) != 0]
         if current_positions:
             has_active_position = True
-            active_symbol = current_positions[0]  # only one allowed
+            active_symbol = current_positions[0]
         else:
             has_active_position = False
             active_symbol = None
-            # Also reset trade_state for all symbols that are not in a trade (clean up stale data)
             for sym in SYMBOLS:
                 if trade_state[sym]:
                     trade_state[sym] = {}
 
+        # Get current HMM regime (once per loop)
+        regime_str, good_to_trade = get_current_regime()
+        print(f"HMM regime: {regime_str} – {'OK to trade' if good_to_trade else 'Not trading'}")
+
         for sym in SYMBOLS:
-            # Skip if we already have an active position and it's not this symbol (we only manage the active one)
             if has_active_position and active_symbol != sym:
-                # For the active symbol, we still need to manage its exit
                 if sym == active_symbol:
                     pass
                 else:
                     continue
 
-            # Fetch latest 1‑hour bars
             new_data = get_1h_bars_yf(sym, period="5d")
             if new_data.empty:
                 continue
@@ -227,14 +274,12 @@ while True:
                 dataframes[sym] = df
                 last_timestamp[sym] = latest_dt
 
-            # Get latest bar values
             last = dataframes[sym].iloc[-1]
             close = last['close']
             atr_val = last['atr']
             if pd.isna(atr_val):
                 atr_val = 1.0
 
-            # Count signals
             signal_count = 0
             signal_names = []
             for col in ['sig_rsi', 'sig_macd', 'sig_bb', 'sig_aroon', 'sig_stoch', 'sig_ema', 'sig_obv', 'sig_tdi']:
@@ -242,7 +287,6 @@ while True:
                     signal_count += 1
                     signal_names.append(col[4:])
 
-            # Get current position details for this symbol (from Alpaca)
             pos_shares = 0
             pos_entry = None
             for p in positions:
@@ -251,9 +295,8 @@ while True:
                     pos_entry = float(p.avg_entry_price)
                     break
 
-            # --- Manage existing position (if this symbol is the active one) ---
+            # --- Manage existing position ---
             if pos_shares > 0 and sym == active_symbol:
-                # Initialize trade state if first time
                 if not trade_state[sym]:
                     trade_state[sym] = {
                         'entry_price': pos_entry,
@@ -271,26 +314,22 @@ while True:
                     send_telegram_message(f"📈 Trade opened: {pos_shares} {sym} @ {pos_entry:.2f}\nStop: ${trade_state[sym]['stop_price']:.2f}\nTP1: ${pos_entry + 1.5 * atr_val:.2f}\nTP2: ${pos_entry + 3 * atr_val:.2f}")
 
                 ts = trade_state[sym]
-                # Update highest close
                 if close > ts['highest_close']:
                     ts['highest_close'] = close
                     print(f"{sym}: New highest close: ${close:.2f}")
 
-                # Breakeven
                 if not ts.get('breakeven_activated', False) and close >= ts['entry_price'] + atr_val:
                     ts['stop_price'] = ts['entry_price']
                     ts['breakeven_activated'] = True
                     print(f"{sym}: Breakeven stop activated at ${ts['stop_price']:.2f}")
                     send_telegram_message(f"🔒 {sym}: Breakeven stop (entry ${ts['entry_price']:.2f})")
 
-                # Trailing
                 if ts.get('breakeven_activated', False):
                     new_stop = ts['highest_close'] - 2 * atr_val
                     if new_stop > ts['stop_price']:
                         ts['stop_price'] = new_stop
                         print(f"{sym}: Trailing stop raised to ${ts['stop_price']:.2f}")
 
-                # TP1
                 tp1_price = ts['entry_price'] + 1.5 * atr_val
                 if not ts.get('tp1_hit', False) and close >= tp1_price:
                     shares_to_sell = max(1, int(pos_shares / 2))
@@ -301,7 +340,6 @@ while True:
                         ts['shares_after_tp1'] = pos_shares - shares_to_sell
                         send_telegram_message(f"🎯 {sym} TP1 at ${close:.2f}. Sold {shares_to_sell}. Remaining {ts['shares_after_tp1']}.")
 
-                # TP2
                 tp2_price = ts['entry_price'] + 3 * atr_val
                 if ts.get('tp1_hit', False) and not ts.get('tp2_hit', False) and close >= tp2_price:
                     remaining = ts.get('shares_after_tp1', pos_shares)
@@ -313,7 +351,6 @@ while True:
                         new_remaining = remaining - shares_to_sell_2
                         send_telegram_message(f"🎯🎯 {sym} TP2 at ${close:.2f}. Sold {shares_to_sell_2}. Remaining {new_remaining}.")
 
-                # Stop loss
                 if close <= ts['stop_price']:
                     print(f"{sym}: Stop loss hit at ${close:.2f} – selling {pos_shares} shares")
                     broker.submit_order(sym, pos_shares, "sell")
@@ -323,8 +360,8 @@ while True:
                     active_symbol = None
                     continue
 
-            # --- Entry logic (only if no active position and signal_count >= 3) ---
-            if not has_active_position and signal_count >= 3:
+            # --- Entry logic (no position) – requires HMM good AND signal_count >= 3 ---
+            if not has_active_position and good_to_trade and signal_count >= 3:
                 stop_dist = 2 * atr_val
                 if stop_dist > 0:
                     risk_percent = 0.01
@@ -334,17 +371,11 @@ while True:
                     size = 1
                 print(f"BUY signal for {sym}: placing order for {size} shares")
                 broker.submit_order(sym, size, "buy")
-                send_telegram_message(f"🚀 BUY {size} {sym} @ {close:.2f}\nSignals: {signal_count}/8 ({', '.join(signal_names)})")
+                send_telegram_message(f"🚀 BUY {size} {sym} @ {close:.2f}\nHMM: {regime_str}\nSignals: {signal_count}/8 ({', '.join(signal_names)})")
                 has_active_position = True
                 active_symbol = sym
-                # Trade state will be initialized on next loop when the position appears
-                # Wait a moment before checking more symbols this iteration
                 time.sleep(5)
                 continue
-
-            # Optional: print signal counts for debugging (verbose, uncomment if needed)
-            # if signal_count > 0:
-            #     print(f"{sym}: {signal_count}/8 signals {signal_names}")
 
         # Update safety net
         account = trading_client.get_account()
@@ -356,7 +387,7 @@ while True:
         if has_active_position and active_symbol:
             print(f"Active position: {active_symbol} (only one allowed)")
         else:
-            print("No active position – scanning all 8 ETFs for new signals.")
+            print(f"No active position. HMM = {regime_str} – scanning 8 ETFs.")
         print("-" * 50)
         time.sleep(60)
 
