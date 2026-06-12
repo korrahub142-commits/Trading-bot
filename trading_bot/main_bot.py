@@ -1,11 +1,10 @@
-# main_bot.py – 8‑indicator strategy on 1‑hour bars (Alpaca data)
+# main_bot.py – 8‑indicator strategy on 1‑hour bars (pure pandas, no 'ta')
 import time
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import os
 import requests
-import ta
 
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
@@ -69,55 +68,107 @@ trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
 # ------------------------------
-# 8‑indicator calculation function (same as before)
+# Pure pandas indicator functions (no 'ta')
 # ------------------------------
-def compute_indicators(df):
-    """Returns a DataFrame with 8 boolean signals (True = buy)."""
+def rsi(close, period=14):
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def macd(close, fast=12, slow=26, signal=9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line
+
+def bollinger_bands(close, window=20, num_std=2):
+    rolling_mean = close.rolling(window=window).mean()
+    rolling_std = close.rolling(window=window).std()
+    lower_band = rolling_mean - (rolling_std * num_std)
+    return lower_band
+
+def aroon(high, low, window=25):
+    aroon_up = 100 * high.rolling(window=window+1).apply(lambda x: x.argmax()) / window
+    aroon_down = 100 * low.rolling(window=window+1).apply(lambda x: x.argmin()) / window
+    return aroon_up, aroon_down
+
+def stoch_rsi(close, period=14, smooth=3):
+    rsi_vals = rsi(close, period)
+    stochrsi = (rsi_vals - rsi_vals.rolling(period).min()) / (rsi_vals.rolling(period).max() - rsi_vals.rolling(period).min())
+    stochrsi_k = stochrsi.rolling(smooth).mean()
+    stochrsi_d = stochrsi_k.rolling(smooth).mean()
+    return stochrsi_d
+
+def ema(close, period):
+    return close.ewm(span=period, adjust=False).mean()
+
+def obv(close, volume):
+    obv_vals = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+    return obv_vals
+
+def tdi(close, rsi_period=13, green_period=2, red_period=7):
+    rsi_vals = rsi(close, rsi_period)
+    tdi_green = rsi_vals.rolling(green_period).mean()
+    tdi_red = tdi_green.rolling(red_period).mean()
+    return tdi_green, tdi_red
+
+def atr(high, low, close, period=14):
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    return atr
+
+# ------------------------------
+# Compute all 8 signals
+# ------------------------------
+def compute_signals(df):
+    """Adds boolean signal columns to df (True = buy)."""
     df = df.copy()
     # 1. RSI < 35
-    rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-    rsi_sig = rsi < 35
-    # 2. MACD bullish crossover
-    macd = ta.trend.MACD(df['close'])
-    macd_sig = macd.macd() > macd.macd_signal()
-    # 3. Bollinger lower band touch
-    bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
-    bb_sig = df['close'] < bb.bollinger_lband()
-    # 4. AROON up >70 and down <30
-    aroon = ta.trend.AroonIndicator(df['high'], df['low'], window=25)
-    aroon_sig = (aroon.aroon_up() > 70) & (aroon.aroon_down() < 30)
-    # 5. Stochastic RSI <20
-    stoch = ta.momentum.StochRSIIndicator(df['close'], window=14)
-    stoch_sig = stoch.stochrsi_d() < 20
-    # 6. EMA 9 > EMA 21
-    ema9 = ta.trend.EMAIndicator(df['close'], window=9).ema_indicator()
-    ema21 = ta.trend.EMAIndicator(df['close'], window=21).ema_indicator()
-    ema_sig = ema9 > ema21
-    # 7. OBV rising (5‑bar lookback)
-    obv = ta.volume.OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
-    obv_sig = obv > obv.shift(5)
-    # 8. TDI simplified
-    rsi13 = ta.momentum.RSIIndicator(df['close'], window=13).rsi()
-    tdi_green = rsi13.rolling(2).mean()
-    tdi_red = tdi_green.rolling(7).mean()
-    tdi_sig = tdi_green > tdi_red
+    df['rsi'] = rsi(df['close'], 14)
+    df['sig_rsi'] = df['rsi'] < 35
 
-    signals = pd.DataFrame({
-        'rsi': rsi_sig,
-        'macd': macd_sig,
-        'bb': bb_sig,
-        'aroon': aroon_sig,
-        'stoch': stoch_sig,
-        'ema': ema_sig,
-        'obv': obv_sig,
-        'tdi': tdi_sig
-    })
-    return signals
+    # 2. MACD bullish: MACD line > signal line
+    macd_line, signal_line = macd(df['close'])
+    df['sig_macd'] = macd_line > signal_line
+
+    # 3. Bollinger lower band touch: close < lower band
+    lower_band = bollinger_bands(df['close'], 20, 2)
+    df['sig_bb'] = df['close'] < lower_band
+
+    # 4. AROON: up > 70 and down < 30
+    aroon_up, aroon_down = aroon(df['high'], df['low'], 25)
+    df['sig_aroon'] = (aroon_up > 70) & (aroon_down < 30)
+
+    # 5. Stochastic RSI < 20
+    stoch_d = stoch_rsi(df['close'], 14, 3)
+    df['sig_stoch'] = stoch_d < 20
+
+    # 6. EMA 9 > EMA 21
+    ema9 = ema(df['close'], 9)
+    ema21 = ema(df['close'], 21)
+    df['sig_ema'] = ema9 > ema21
+
+    # 7. OBV rising: current OBV > OBV 5 bars ago
+    obv_vals = obv(df['close'], df['volume'])
+    df['sig_obv'] = obv_vals > obv_vals.shift(5)
+
+    # 8. TDI simplified: green > red
+    tdi_green, tdi_red = tdi(df['close'], 13, 2, 7)
+    df['sig_tdi'] = tdi_green > tdi_red
+
+    return df
 
 # ------------------------------
 # Load initial 1‑hour historical data from Alpaca
 # ------------------------------
-def get_1h_bars(symbol, days_back=30):
+def get_1h_bars(symbol, days_back=90):
     end = datetime.now()
     start = end - timedelta(days=days_back)
     request = StockBarsRequest(
@@ -138,24 +189,20 @@ def get_1h_bars(symbol, days_back=30):
     return df
 
 print("Fetching 1‑hour SPY data from Alpaca...")
-df_1h = get_1h_bars('SPY', days_back=90)  # ~90 days of 1‑hour bars
+df_1h = get_1h_bars('SPY', days_back=90)
 print(f"Loaded {len(df_1h)} 1‑hour bars")
 
-# Pre‑compute indicators on the full DataFrame
-signals = compute_indicators(df_1h)
-for col in signals.columns:
-    df_1h[f'sig_{col}'] = signals[col]
+# Compute all indicators and signals
+df_1h = compute_signals(df_1h)
 
-# Compute ATR (14 periods)
-atr_ind = ta.volatility.AverageTrueRange(high=df_1h['high'], low=df_1h['low'],
-                                         close=df_1h['close'], window=14)
-df_1h['atr'] = atr_ind.average_true_range()
+# Compute ATR for stop loss
+df_1h['atr'] = atr(df_1h['high'], df_1h['low'], df_1h['close'], 14)
 df_1h = df_1h.dropna().copy()
 
 # ------------------------------
 # Initialize bot components
 # ------------------------------
-print("Initializing Trading Bot (8‑indicator, 1‑hour)...")
+print("Initializing Trading Bot (8‑indicator, 1‑hour, pure pandas)...")
 broker = BrokerConnection(API_KEY, SECRET_KEY, is_paper=True)
 account = trading_client.get_account()
 initial_value = float(account.portfolio_value)
@@ -189,21 +236,15 @@ while True:
             print(f"New 1‑hour bar detected: {latest_dt}")
             new_row = new_bars.iloc[-1:].copy()
             df_1h = pd.concat([df_1h, new_row])
-            # Recompute indicators for the new row (simpler: recompute whole frame)
-            signals_new = compute_indicators(df_1h)
-            for col in signals_new.columns:
-                df_1h[f'sig_{col}'] = signals_new[col]
-            atr_new = ta.volatility.AverageTrueRange(high=df_1h['high'], low=df_1h['low'],
-                                                     close=df_1h['close'], window=14).average_true_range()
-            df_1h['atr'] = atr_new
+            # Recompute signals for the whole frame (simple but robust)
+            df_1h = compute_signals(df_1h)
+            df_1h['atr'] = atr(df_1h['high'], df_1h['low'], df_1h['close'], 14)
             df_1h = df_1h.dropna().copy()
             last_datetime = latest_dt
 
         # Get latest bar values
         last = df_1h.iloc[-1]
         close = last['close']
-        high = last['high']
-        low = last['low']
         atr_val = last['atr']
         if pd.isna(atr_val):
             atr_val = 1.0
