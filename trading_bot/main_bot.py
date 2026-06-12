@@ -1,4 +1,4 @@
-# main_bot.py – 8‑ETF + HMM regime filter (only trade in Bull/Euphoria)
+# main_bot.py – 8‑ETF + HMM regime filter (3 states) + risk psychology
 import time
 import pandas as pd
 import numpy as np
@@ -7,7 +7,7 @@ import os
 import requests
 import yfinance as yf
 from hmmlearn import hmm
-
+from scipy.linalg import solve
 from alpaca.trading.client import TradingClient
 from allocation import PositionAllocator
 from safety import SafetyNet
@@ -63,39 +63,42 @@ trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 broker = BrokerConnection(API_KEY, SECRET_KEY, is_paper=True)
 
 # ============================================================
-# HMM MARKET REGIME (on SPY daily)
+# HMM MARKET REGIME (3 states, 1.5 years lookback)
 # ============================================================
-def train_hmm_regime():
-    """Train HMM on SPY daily data, return model and label mapping."""
+def train_hmm_regime(lookback_days=540):
     spy = yf.Ticker("SPY")
     end = datetime.now()
-    start = end - timedelta(days=365*2)
+    start = end - timedelta(days=lookback_days)
     df = spy.history(start=start, end=end, interval="1d")
+    if df.empty:
+        raise ValueError("No SPY data for HMM training")
     df['returns'] = np.log(df['Close'] / df['Close'].shift(1))
     df['volatility'] = df['returns'].rolling(20).std() * np.sqrt(252)
     features = df[['returns', 'volatility']].dropna().values
-    model = hmm.GaussianHMM(n_components=5, covariance_type="full", n_iter=1000, random_state=42)
+    if len(features) < 30:
+        raise ValueError("Not enough data points for HMM")
+    # Use 3 states for stability
+    model = hmm.GaussianHMM(n_components=3, covariance_type="full", n_iter=1000,
+                            random_state=42, min_covar=0.01)  # small regularization
     model.fit(features)
     states = model.predict(features)
-    # Determine which state corresponds to Bull/Euphoria (higher mean return)
+    # Determine which state is Bull (highest mean return)
     state_means = []
-    for s in range(5):
+    for s in range(3):
         state_means.append(features[states == s, 0].mean())
-    sorted_states = np.argsort(state_means)
-    # Assume sorted[4] is Euphoria, sorted[3] is Bull, sorted[2] Neutral, sorted[1] Bear, sorted[0] Crash
-    bull_state = sorted_states[3]
-    euphoria_state = sorted_states[4]
-    return model, df, bull_state, euphoria_state
+    # State with highest mean return -> Bull
+    bull_state = int(np.argmax(state_means))
+    # For simplicity, we also consider the second highest? But we only need Bull.
+    return model, df, bull_state
 
-print("Training HMM regime on SPY daily data...")
-hmm_model, hmm_df, BULL_STATE, EUPHORIA_STATE = train_hmm_regime()
-print("HMM ready.")
+print("Training HMM regime on SPY daily data (1.5 years, 3 states)...")
+hmm_model, hmm_df, BULL_STATE = train_hmm_regime(lookback_days=540)
+print(f"HMM ready. Bull state = {BULL_STATE}")
 
 def get_current_regime():
-    """Fetch latest SPY daily bar, predict regime, return string and boolean for good trading."""
     spy = yf.Ticker("SPY")
     end = datetime.now()
-    start = end - timedelta(days=5)  # get last 5 days to be safe
+    start = end - timedelta(days=5)  # get last 5 days
     new_data = spy.history(start=start, end=end, interval="1d")
     if new_data.empty:
         return "Unknown", False
@@ -110,8 +113,6 @@ def get_current_regime():
     state = hmm_model.predict(features)[0]
     if state == BULL_STATE:
         return "Bull", True
-    elif state == EUPHORIA_STATE:
-        return "Euphoria", True
     else:
         return "Other", False
 
@@ -220,7 +221,7 @@ initial_value = float(account.portfolio_value)
 print(f"Initial portfolio value: ${initial_value:,.2f}")
 safety_net = SafetyNet(initial_portfolio_value=initial_value)
 
-send_telegram_message(f"🤖 HMM + 8‑indicator bot started (one active trade max). TP2 enabled. Symbols: {', '.join(SYMBOLS)}")
+send_telegram_message(f"🤖 HMM (3‑state) + 8‑indicator bot started. One trade at a time. TP2 enabled. Symbols: {', '.join(SYMBOLS)}")
 
 # Trade state per symbol
 trade_state = {sym: {} for sym in SYMBOLS}
@@ -229,10 +230,16 @@ last_timestamp = {sym: dataframes[sym].index[-1] for sym in SYMBOLS}
 has_active_position = False
 active_symbol = None
 
+# Trading psychology variables
+consecutive_losses = 0
+last_loss_time = None
+cool_off_minutes = 30
+risk_percent_base = 0.01   # 1% base risk
+
 # ------------------------------
 # Main loop
 # ------------------------------
-print("Starting main loop (checks every 60 seconds). HMM filter active: only trade in Bull/Euphoria.\n")
+print("Starting main loop (checks every 60 seconds). HMM filter active: only trade in Bull regime.\n")
 while True:
     try:
         # Update global position status
@@ -244,6 +251,7 @@ while True:
         else:
             has_active_position = False
             active_symbol = None
+            # Reset trade_state for all symbols
             for sym in SYMBOLS:
                 if trade_state[sym]:
                     trade_state[sym] = {}
@@ -252,6 +260,12 @@ while True:
         regime_str, good_to_trade = get_current_regime()
         print(f"HMM regime: {regime_str} – {'OK to trade' if good_to_trade else 'Not trading'}")
 
+        # If we had a loss recently, cool off
+        cool_off_active = False
+        if last_loss_time and (datetime.now() - last_loss_time).total_seconds() < cool_off_minutes * 60:
+            cool_off_active = True
+            print(f"Cool‑off active for {cool_off_minutes} minutes after loss. No new entries.")
+
         for sym in SYMBOLS:
             if has_active_position and active_symbol != sym:
                 if sym == active_symbol:
@@ -259,6 +273,7 @@ while True:
                 else:
                     continue
 
+            # Fetch latest 1‑hour bars
             new_data = get_1h_bars_yf(sym, period="5d")
             if new_data.empty:
                 continue
@@ -339,6 +354,8 @@ while True:
                         ts['tp1_hit'] = True
                         ts['shares_after_tp1'] = pos_shares - shares_to_sell
                         send_telegram_message(f"🎯 {sym} TP1 at ${close:.2f}. Sold {shares_to_sell}. Remaining {ts['shares_after_tp1']}.")
+                        # Reset consecutive losses on a profitable exit (partial profit)
+                        consecutive_losses = 0
 
                 tp2_price = ts['entry_price'] + 3 * atr_val
                 if ts.get('tp1_hit', False) and not ts.get('tp2_hit', False) and close >= tp2_price:
@@ -350,7 +367,9 @@ while True:
                         ts['tp2_hit'] = True
                         new_remaining = remaining - shares_to_sell_2
                         send_telegram_message(f"🎯🎯 {sym} TP2 at ${close:.2f}. Sold {shares_to_sell_2}. Remaining {new_remaining}.")
+                        consecutive_losses = 0
 
+                # Stop loss hit
                 if close <= ts['stop_price']:
                     print(f"{sym}: Stop loss hit at ${close:.2f} – selling {pos_shares} shares")
                     broker.submit_order(sym, pos_shares, "sell")
@@ -358,20 +377,28 @@ while True:
                     trade_state[sym] = {}
                     has_active_position = False
                     active_symbol = None
+                    consecutive_losses += 1
+                    last_loss_time = datetime.now()
+                    print(f"Consecutive losses: {consecutive_losses}")
                     continue
 
-            # --- Entry logic (no position) – requires HMM good AND signal_count >= 3 ---
-            if not has_active_position and good_to_trade and signal_count >= 3:
+            # --- Entry logic (no position) ---
+            if not has_active_position and good_to_trade and not cool_off_active and signal_count >= 3:
+                # Dynamic risk based on consecutive losses
+                current_risk = risk_percent_base
+                if consecutive_losses >= 2:
+                    current_risk = risk_percent_base * 0.5
+                    print(f"Reducing risk to {current_risk*100:.1f}% due to {consecutive_losses} consecutive losses")
+                # Also reduce risk if market is just Bull (not Euphoria) – we don't have Euphoria detection, so skip.
                 stop_dist = 2 * atr_val
                 if stop_dist > 0:
-                    risk_percent = 0.01
                     equity = float(trading_client.get_account().equity)
-                    size = max(1, int((equity * risk_percent) / stop_dist))
+                    size = max(1, int((equity * current_risk) / stop_dist))
                 else:
                     size = 1
                 print(f"BUY signal for {sym}: placing order for {size} shares")
                 broker.submit_order(sym, size, "buy")
-                send_telegram_message(f"🚀 BUY {size} {sym} @ {close:.2f}\nHMM: {regime_str}\nSignals: {signal_count}/8 ({', '.join(signal_names)})")
+                send_telegram_message(f"🚀 BUY {size} {sym} @ {close:.2f}\nHMM: {regime_str}\nSignals: {signal_count}/8 ({', '.join(signal_names)})\nRisk: {current_risk*100:.1f}%")
                 has_active_position = True
                 active_symbol = sym
                 time.sleep(5)
@@ -387,7 +414,10 @@ while True:
         if has_active_position and active_symbol:
             print(f"Active position: {active_symbol} (only one allowed)")
         else:
-            print(f"No active position. HMM = {regime_str} – scanning 8 ETFs.")
+            if cool_off_active:
+                print(f"Cool‑off active. No new entries. HMM = {regime_str}")
+            else:
+                print(f"No active position. HMM = {regime_str} – scanning 8 ETFs.")
         print("-" * 50)
         time.sleep(60)
 
