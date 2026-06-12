@@ -1,16 +1,13 @@
-# main_bot.py – 8‑indicator strategy on 1‑hour bars (pure pandas, no 'ta')
+# main_bot.py – 8‑indicator strategy on 1‑hour bars (Yahoo Finance data)
 import time
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import os
 import requests
+import yfinance as yf
 
 from alpaca.trading.client import TradingClient
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-
 from allocation import PositionAllocator
 from safety import SafetyNet
 from broker import BrokerConnection
@@ -62,10 +59,10 @@ if not API_KEY or not SECRET_KEY:
     raise ValueError("Missing API keys. Set APCA_API_KEY_ID and APCA_API_SECRET_KEY.")
 
 # ------------------------------
-# Alpaca clients
+# Alpaca trading client (only for orders)
 # ------------------------------
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
-data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+broker = BrokerConnection(API_KEY, SECRET_KEY, is_paper=True)
 
 # ------------------------------
 # Pure pandas indicator functions (no 'ta')
@@ -166,51 +163,37 @@ def compute_signals(df):
     return df
 
 # ------------------------------
-# Load initial 1‑hour historical data from Alpaca
+# Fetch 1‑hour data from Yahoo Finance
 # ------------------------------
-def get_1h_bars(symbol, days_back=90):
-    end = datetime.now()
-    start = end - timedelta(days=days_back)
-    request = StockBarsRequest(
-        symbol_or_symbols=[symbol],
-        timeframe=TimeFrame.Hour,
-        start=start,
-        end=end,
-        limit=10000
-    )
-    bars = data_client.get_stock_bars(request)
-    df = bars.df
+def get_1h_bars_yf(symbol, period="60d"):
+    """Fetch 1‑hour bars from Yahoo Finance (max 60 days)."""
+    ticker = yf.Ticker(symbol)
+    df = ticker.history(period=period, interval="1h")
     if df.empty:
         raise ValueError(f"No 1‑hour data for {symbol}")
-    df = df.reset_index()
-    df = df.rename(columns={'timestamp': 'datetime', 'open': 'open', 'high': 'high',
-                            'low': 'low', 'close': 'close', 'volume': 'volume'})
-    df.set_index('datetime', inplace=True)
+    df = df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
     return df
 
-print("Fetching 1‑hour SPY data from Alpaca...")
-df_1h = get_1h_bars('SPY', days_back=90)
+print("Fetching 1‑hour SPY data from Yahoo Finance...")
+df_1h = get_1h_bars_yf('SPY', period="60d")
 print(f"Loaded {len(df_1h)} 1‑hour bars")
 
-# Compute all indicators and signals
+# Compute indicators and signals
 df_1h = compute_signals(df_1h)
-
-# Compute ATR for stop loss
 df_1h['atr'] = atr(df_1h['high'], df_1h['low'], df_1h['close'], 14)
 df_1h = df_1h.dropna().copy()
 
 # ------------------------------
 # Initialize bot components
 # ------------------------------
-print("Initializing Trading Bot (8‑indicator, 1‑hour, pure pandas)...")
-broker = BrokerConnection(API_KEY, SECRET_KEY, is_paper=True)
+print("Initializing Trading Bot (8‑indicator, 1‑hour, Yahoo Finance data)...")
 account = trading_client.get_account()
 initial_value = float(account.portfolio_value)
 print(f"Initial portfolio value: ${initial_value:,.2f}")
 
 safety_net = SafetyNet(initial_portfolio_value=initial_value)
 
-send_telegram_message("🤖 8‑indicator bot (1‑hour) started. Monitoring SPY.")
+send_telegram_message("🤖 8‑indicator bot (1‑hour, Yahoo) started. Monitoring SPY.")
 
 # Trade state
 trade_state = {}
@@ -223,20 +206,20 @@ last_datetime = df_1h.index[-1]
 
 while True:
     try:
-        # Fetch latest 1‑hour bars (last 5 days to catch any new bar)
-        new_bars = get_1h_bars('SPY', days_back=5)
-        if new_bars.empty:
+        # Fetch latest 1‑hour bars (last 5 days)
+        new_data = get_1h_bars_yf('SPY', period="5d")
+        if new_data.empty:
             print("No new data yet.")
             time.sleep(60)
             continue
 
-        latest_dt = new_bars.index[-1]
+        latest_dt = new_data.index[-1]
         if latest_dt > last_datetime:
-            # New bar appeared – add it to our DataFrame
+            # New bar detected
             print(f"New 1‑hour bar detected: {latest_dt}")
-            new_row = new_bars.iloc[-1:].copy()
+            new_row = new_data.iloc[-1:].copy()
             df_1h = pd.concat([df_1h, new_row])
-            # Recompute signals for the whole frame (simple but robust)
+            # Recompute signals for the whole frame
             df_1h = compute_signals(df_1h)
             df_1h['atr'] = atr(df_1h['high'], df_1h['low'], df_1h['close'], 14)
             df_1h = df_1h.dropna().copy()
@@ -270,7 +253,7 @@ while True:
 
         # --- Entry logic (no position) ---
         if current_spy_shares == 0:
-            if signal_count >= 3:  # threshold = 3
+            if signal_count >= 3:
                 stop_dist = 2 * atr_val
                 if stop_dist > 0:
                     risk_percent = 0.01
@@ -281,11 +264,10 @@ while True:
                 print(f"BUY signal: placing order for {size} shares of SPY")
                 broker.submit_order("SPY", size, "buy")
                 send_telegram_message(f"🚀 8‑indicator BUY {size} SPY @ {close:.2f}\nSignals: {signal_count}/8 ({', '.join(signal_names)})")
-                # trade_state will be initialised on next loop when position appears
             else:
                 print(f"No buy. Only {signal_count}/8 signals.")
         else:
-            # --- Manage existing position ---
+            # --- Manage existing position (same as before) ---
             if 'SPY' not in trade_state and entry_price:
                 trade_state['SPY'] = {
                     'entry_price': entry_price,
@@ -319,7 +301,7 @@ while True:
                         ts['stop_price'] = new_stop
                         print(f"Trailing stop raised to ${ts['stop_price']:.2f}")
 
-                # Take profit 1 (sell half at entry + 1.5*ATR)
+                # Take profit 1
                 tp1_price = ts['entry_price'] + 1.5 * atr_val
                 if not ts['tp1_hit'] and close >= tp1_price:
                     shares_to_sell = max(1, int(current_spy_shares / 2))
