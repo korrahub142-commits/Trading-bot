@@ -1,4 +1,4 @@
-# main_bot.py – 8‑indicator strategy on 1‑hour bars (Yahoo Finance data)
+# main_bot.py – 8‑indicator strategy on 1‑hour bars (Yahoo Finance data) with TP2
 import time
 import pandas as pd
 import numpy as np
@@ -193,7 +193,7 @@ print(f"Initial portfolio value: ${initial_value:,.2f}")
 
 safety_net = SafetyNet(initial_portfolio_value=initial_value)
 
-send_telegram_message("🤖 8‑indicator bot (1‑hour, Yahoo) started. Monitoring SPY.")
+send_telegram_message("🤖 8‑indicator bot (1‑hour, Yahoo) started. Monitoring SPY (TP2 enabled).")
 
 # Trade state
 trade_state = {}
@@ -267,19 +267,22 @@ while True:
             else:
                 print(f"No buy. Only {signal_count}/8 signals.")
         else:
-            # --- Manage existing position (same as before) ---
+            # --- Manage existing position ---
             if 'SPY' not in trade_state and entry_price:
                 trade_state['SPY'] = {
                     'entry_price': entry_price,
                     'initial_shares': current_spy_shares,
                     'tp1_hit': False,
+                    'tp2_hit': False,
+                    'shares_after_tp1': current_spy_shares,
                     'stop_price': entry_price - 2 * atr_val,
                     'highest_close': close,
                     'breakeven_activated': False
                 }
                 print(f"Initial stop set at ${trade_state['SPY']['stop_price']:.2f}")
                 print(f"TP1 level: ${entry_price + 1.5 * atr_val:.2f}")
-                send_telegram_message(f"📈 Trade opened: {current_spy_shares} SPY @ {entry_price:.2f}\nStop: ${trade_state['SPY']['stop_price']:.2f}")
+                print(f"TP2 level: ${entry_price + 3 * atr_val:.2f}")
+                send_telegram_message(f"📈 Trade opened: {current_spy_shares} SPY @ {entry_price:.2f}\nStop: ${trade_state['SPY']['stop_price']:.2f}\nTP1: ${entry_price + 1.5 * atr_val:.2f}\nTP2: ${entry_price + 3 * atr_val:.2f}")
 
             if 'SPY' in trade_state:
                 ts = trade_state['SPY']
@@ -301,15 +304,29 @@ while True:
                         ts['stop_price'] = new_stop
                         print(f"Trailing stop raised to ${ts['stop_price']:.2f}")
 
-                # Take profit 1
+                # --- Take profit 1 (sell half at entry + 1.5*ATR) ---
                 tp1_price = ts['entry_price'] + 1.5 * atr_val
-                if not ts['tp1_hit'] and close >= tp1_price:
+                if not ts.get('tp1_hit', False) and close >= tp1_price:
                     shares_to_sell = max(1, int(current_spy_shares / 2))
                     if shares_to_sell > 0:
-                        print(f"Take profit hit at ${close:.2f} – selling {shares_to_sell} shares")
+                        print(f"TP1 hit at ${close:.2f} – selling {shares_to_sell} shares")
                         broker.submit_order("SPY", shares_to_sell, "sell")
                         ts['tp1_hit'] = True
-                        send_telegram_message(f"🎯 TP1 at ${close:.2f}. Sold {shares_to_sell} SPY. Remaining {current_spy_shares - shares_to_sell}.")
+                        ts['shares_after_tp1'] = current_spy_shares - shares_to_sell
+                        send_telegram_message(f"🎯 TP1 at ${close:.2f}. Sold {shares_to_sell} SPY. Remaining {ts['shares_after_tp1']}.")
+
+                # --- Take profit 2 (sell half of remaining at entry + 3*ATR) ---
+                tp2_price = ts['entry_price'] + 3 * atr_val
+                if ts.get('tp1_hit', False) and not ts.get('tp2_hit', False) and close >= tp2_price:
+                    remaining = ts.get('shares_after_tp1', current_spy_shares)
+                    shares_to_sell_2 = max(1, int(remaining / 2))
+                    if shares_to_sell_2 > 0 and remaining > 0:
+                        print(f"TP2 hit at ${close:.2f} – selling {shares_to_sell_2} shares")
+                        broker.submit_order("SPY", shares_to_sell_2, "sell")
+                        ts['tp2_hit'] = True
+                        new_remaining = remaining - shares_to_sell_2
+                        send_telegram_message(f"🎯🎯 TP2 at ${close:.2f}. Sold {shares_to_sell_2} SPY. Remaining {new_remaining}.")
+                        ts['shares_after_tp2'] = new_remaining
 
                 # Stop loss
                 if close <= ts['stop_price']:
@@ -330,7 +347,9 @@ while True:
         # Print holding status
         if current_spy_shares > 0 and 'SPY' in trade_state:
             ts = trade_state['SPY']
-            print(f"Holding {current_spy_shares} shares. Stop: ${ts['stop_price']:.2f} | TP1: {'Hit' if ts['tp1_hit'] else 'Not hit'}")
+            tp1_status = "Hit" if ts.get('tp1_hit', False) else "Not hit"
+            tp2_status = "Hit" if ts.get('tp2_hit', False) else "Not hit"
+            print(f"Holding {current_spy_shares} shares. Stop: ${ts['stop_price']:.2f} | TP1: {tp1_status} | TP2: {tp2_status}")
         elif current_spy_shares > 0:
             print(f"Holding {current_spy_shares} shares (initial stop not set yet).")
 
